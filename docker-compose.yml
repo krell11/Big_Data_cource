@@ -1,0 +1,25 @@
+services:
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      PIPELINE_ROOT: /opt/airflow/project
+      PIPELINE_RAW_DIR: /opt/airflow/project/data/raw
+      PIPELINE_CURATED_DIR: /opt/airflow/project/data/curated/json
+      PIPELINE_MAX_ROWS: "5000"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/project/scripts
+      - ./spark:/opt/airflow/project/spark
+      - ./training:/opt/airflow/project/training
+      - ./docs:/opt/airflow/project/docs
+      - pipeline_data:/opt/airflow/project/data
+    command: airflow standalone
+
+volumes:
+  pipeline_data:

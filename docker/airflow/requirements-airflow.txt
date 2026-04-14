@@ -1,0 +1,4 @@
+# Extra deps for DAGs + ingest + local Spark submit (matches PySpark version).
+datasets>=2.16.0
+pyarrow>=14.0.0
+pyspark==3.5.1
