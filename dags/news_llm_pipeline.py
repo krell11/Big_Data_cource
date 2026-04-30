@@ -1,10 +1,3 @@
-"""
-Airflow DAG scaffold for News -> Spark -> SFT pipeline.
-
-This file contains only orchestration skeleton.
-Fill business logic in referenced modules yourself.
-"""
-
 from datetime import datetime, timedelta
 import json
 import os
