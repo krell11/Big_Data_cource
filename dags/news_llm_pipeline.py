@@ -15,11 +15,51 @@ from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
 
 
+def _project_dir() -> str:
+    return (os.environ.get("PROJECT_DIR") or "").strip() or "."
+
+
 def _data_root() -> str:
     project_dir = (os.environ.get("PROJECT_DIR") or "").strip()
     if project_dir:
         return os.path.join(project_dir, "data")
     return "data"
+
+
+def _spark_submit_cmd(script_name: str, cli_args: list[str]) -> list[str]:
+    project = _project_dir()
+    spark_master = (os.environ.get("PIPELINE_SPARK_MASTER") or "local[*]").strip()
+    script_path = os.path.join(project, "spark", script_name)
+    lib_path = os.path.join(project, "spark", "lib.py")
+    if not os.path.isfile(script_path):
+        raise AirflowException(f"Spark script not found: {script_path}")
+    if not os.path.isfile(lib_path):
+        raise AirflowException(f"Spark helper not found: {lib_path}")
+    return [
+        "spark-submit",
+        "--master",
+        spark_master,
+        "--py-files",
+        lib_path,
+        script_path,
+        *cli_args,
+    ]
+
+
+def _run_spark_submit(script_name: str, cli_args: list[str], timeout: int = 1800) -> None:
+    cmd = _spark_submit_cmd(script_name, cli_args)
+    proc = subprocess.run(
+        cmd,
+        cwd=_project_dir(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-6000:]
+        raise AirflowException(
+            f"spark-submit {script_name} exit {proc.returncode}. Cmd: {' '.join(cmd)}\n{tail}"
+        )
 
 
 _EXTRACT_PRESETS = {
@@ -290,40 +330,27 @@ def transform_bronze_to_silver(**context):
     out_path = _silver_path_for_ds(ds)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    n = 0
-    with open(inp_path, encoding="utf-8") as inp, open(out_path, "w", encoding="utf-8") as out:
-        for line in inp:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            row = {
-                "url": obj["url"],
-                "title": obj["title"].strip(),
-                "body": obj["content"].strip(),
-                "authors": obj.get("authors") or [],
-                "published_at": obj["published_at"],
-                "process_date": obj["process_date"],
-                "title_len": len(obj["title"]),
-                "body_len": len(obj["content"]),
-                "n_authors": len(obj.get("authors") or []),
-                "layer": "silver",
-            }
-            out.write(json.dumps(row, ensure_ascii=False) + "\n")
-            n += 1
-
-    if n == 0:
-        raise AirflowException("Silver transform: no rows written")
+    _run_spark_submit(
+        "bronze_to_silver.py",
+        ["--input", inp_path, "--output", out_path],
+    )
 
     meta_path = os.path.join(os.path.dirname(out_path), "_transform_meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"rows": n, "engine": "python_stdlib", "input": inp_path, "output": out_path},
-            f,
-            indent=2,
-        )
+    if not os.path.isfile(meta_path):
+        raise AirflowException(f"PySpark did not write meta: {meta_path}")
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    n = int(meta.get("rows") or 0)
+    if n == 0:
+        raise AirflowException("Silver transform (PySpark): no rows written")
 
-    return {"output_path": out_path, "rows": n, "process_date": ds}
+    return {
+        "output_path": out_path,
+        "rows": n,
+        "process_date": ds,
+        "engine": "pyspark",
+        "spark_app": meta.get("spark_app"),
+    }
 
 
 def _silver_path_from_context(context: dict) -> str:
@@ -335,14 +362,6 @@ def _silver_path_from_context(context: dict) -> str:
     return _silver_path_for_ds(_ds(context))
 
 
-def _mock_topics(title: str) -> list:
-    pool = ["nlp", "deep-learning", "systems", "theory", "evaluation"]
-    if not title:
-        return ["unknown"]
-    h = sum(ord(c) for c in title[:80]) % len(pool)
-    return [pool[h], pool[(h + 2) % len(pool)]]
-
-
 def enrich_silver_to_gold(**context):
     ds = _ds(context)
     inp_path = _silver_path_from_context(context)
@@ -352,32 +371,27 @@ def enrich_silver_to_gold(**context):
     out_path = _gold_path_for_ds(ds)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    n = 0
-    with open(inp_path, encoding="utf-8") as inp, open(out_path, "w", encoding="utf-8") as out:
-        for line in inp:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            title = obj.get("title") or ""
-            body = obj.get("body") or ""
-            body_len = int(obj.get("body_len") or len(body))
-            mock_score = round(0.55 + min(body_len, 8000) / 20000.0, 4)
-            enriched = {
-                **obj,
-                "mock_topics": _mock_topics(title),
-                "mock_quality_score": mock_score,
-                "mock_summary": f"[MOCK] Статья «{title[:120]}»; ~{body_len} символов текста.",
-                "gold_schema_version": 1,
-                "layer": "gold",
-            }
-            out.write(json.dumps(enriched, ensure_ascii=False) + "\n")
-            n += 1
+    _run_spark_submit(
+        "silver_to_gold.py",
+        ["--input", inp_path, "--output", out_path],
+    )
 
+    meta_path = os.path.join(os.path.dirname(out_path), "_enrich_meta.json")
+    if not os.path.isfile(meta_path):
+        raise AirflowException(f"PySpark did not write meta: {meta_path}")
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    n = int(meta.get("rows") or 0)
     if n == 0:
-        raise AirflowException("Gold enrich: no rows written")
+        raise AirflowException("Gold enrich (PySpark): no rows written")
 
-    return {"output_path": out_path, "rows": n, "process_date": ds}
+    return {
+        "output_path": out_path,
+        "rows": n,
+        "process_date": ds,
+        "engine": "pyspark",
+        "spark_app": meta.get("spark_app"),
+    }
 
 
 def _gold_path_from_context(context: dict) -> str:
@@ -629,7 +643,7 @@ default_args = {
 
 with DAG(
     dag_id="news_llm_pipeline",
-    description="Bronze→Gold + SFT Qwen2.5-0.5B на arXiv (HF Trainer, CUDA при наличии GPU)",
+    description="Bronze→Gold (PySpark) + SFT Qwen2.5-0.5B на arXiv (HF Trainer, CUDA при наличии GPU)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule="@daily",
@@ -652,11 +666,13 @@ with DAG(
     transform_bronze_to_silver = PythonOperator(
         task_id="transform_bronze_to_silver",
         python_callable=transform_bronze_to_silver,
+        execution_timeout=timedelta(minutes=30),
     )
 
     enrich_silver_to_gold = PythonOperator(
         task_id="enrich_silver_to_gold",
         python_callable=enrich_silver_to_gold,
+        execution_timeout=timedelta(minutes=30),
     )
 
     build_sft_dataset = PythonOperator(
